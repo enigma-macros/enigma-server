@@ -367,12 +367,21 @@ function toast(m) { var t = q("#toast"); t.textContent = m; t.hidden = false; cl
 
 async function api(path, opt) {
   opt = opt || {};
-  var h = { "X-Requested-With": "enigma" }, body;
-  if (opt.body) { h["Content-Type"] = "application/json"; body = JSON.stringify(opt.body); }
-  var r = await fetch(path, { method: opt.method || "GET", headers: h, body: body, credentials: "same-origin" });
-  var j = null;
+  var method = opt.method || "GET", h = { "X-Requested-With": "enigma" }, body;
+  if (method !== "GET") { h["Content-Type"] = "application/json"; body = JSON.stringify(opt.body || {}); }
+  var r, j = null;
+  for (var attempt = 0; ; attempt++) {
+    r = await fetch(path, { method: method, headers: h, body: body, credentials: "same-origin" });
+    // 502/503 = the free server was asleep or restarting and never saw the request, so asking again is safe.
+    if ((r.status === 502 || r.status === 503) && attempt < 4) {
+      if (attempt === 0) toast("Server is waking up, please wait a few seconds...");
+      await new Promise(function (ok) { setTimeout(ok, 6000); });
+      continue;
+    }
+    break;
+  }
   try { j = await r.json(); } catch (e) { /* not json */ }
-  if (!r.ok || (j && j.ok === false)) { var err = new Error((j && j.error) || "Something went wrong. Please try again."); err.data = j; throw err; }
+  if (!r.ok || (j && j.ok === false)) { var err = new Error((j && j.error) || ("Something went wrong (code " + r.status + "). Please try again in a minute.")); err.data = j; throw err; }
   return j;
 }
 
