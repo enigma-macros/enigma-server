@@ -53,6 +53,11 @@ const PLANS = {
   d30: { id: 'd30', name: '30 Days', days: 30, price: 300 },
   life: { id: 'life', name: 'Lifetime', days: null, price: 1500 },
 };
+// Free trial (not a purchasable plan). TRIAL_HOURS=0 turns it off.
+const TRIAL_HOURS = process.env.TRIAL_HOURS === undefined || process.env.TRIAL_HOURS === '' ? 24 : Number(process.env.TRIAL_HOURS) || 0;
+// Discord accounts younger than this many days cannot start a free trial (blocks throw-away accounts). 0 turns the check off.
+const TRIAL_MIN_ACCOUNT_DAYS = process.env.TRIAL_MIN_ACCOUNT_DAYS === undefined || process.env.TRIAL_MIN_ACCOUNT_DAYS === '' ? 14 : Number(process.env.TRIAL_MIN_ACCOUNT_DAYS) || 0;
+const planInfo = (id) => PLANS[id] || (id === 'trial' ? { id: 'trial', name: 'Free Trial', days: null } : null);
 
 /* -------------------------------------------------------------- database */
 // One JSON file, written atomically with a .bak copy. Fine for a few thousand customers.
@@ -70,7 +75,13 @@ let DB = { seq: { user: 0, order: 0 }, users: [], licenses: [], orders: [] };
     console.error('Loaded the backup copy instead.');
   }
 })();
+DB.trial_hwids = DB.trial_hwids || []; // PCs (hashed) that already used a free trial
+// Optional: keep the data in Supabase (set SUPABASE_URL and SUPABASE_KEY). Needed on free hosts like Render whose files are wiped on restart.
+const REMOTE = process.env.SUPABASE_URL && process.env.SUPABASE_KEY
+  ? require('./supabase-store')({ url: process.env.SUPABASE_URL.trim(), key: process.env.SUPABASE_KEY.trim() })
+  : null;
 function saveDb() {
+  if (REMOTE) { REMOTE.schedule(() => DB); return; }
   const tmp = STORE_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(DB));
   if (fs.existsSync(STORE_FILE)) fs.copyFileSync(STORE_FILE, STORE_FILE + '.bak');
@@ -110,6 +121,18 @@ function licState(l) {
   if (l.revoked) return 'revoked';
   if (l.expires_at === null) return 'active';
   return l.expires_at > now() ? 'active' : 'expired';
+}
+
+// Free trial: a normal license (own key) that lasts TRIAL_HOURS from the moment it is started.
+function grantTrial(userId) {
+  const t = now();
+  const l = { user_id: userId, key: genKey(), plan: 'trial', expires_at: t + TRIAL_HOURS * 3600, hwid_hash: null, hwid_reset_at: 0, revoked: 0, created_at: t };
+  DB.licenses.push(l);
+  return l;
+}
+// A Discord ID contains the time the account was created.
+function discordAccountAgeDays(discordId) {
+  try { return (Date.now() - Number((BigInt(discordId) >> 22n) + 1420070400000n)) / 86400000; } catch (e) { return 0; }
 }
 
 // Adds a plan to a user. Timed plans stack: new days are added after the current expiry.
@@ -254,9 +277,10 @@ function serveStatic(req, res) {
 /* ---------------------------------------------------------------- views */
 function licView(l) {
   if (!l) return { status: 'none' };
-  const plan = PLANS[l.plan];
+  const plan = planInfo(l.plan);
   return {
     status: licState(l),
+    trial: l.plan === 'trial',
     plan: l.plan,
     planName: plan ? plan.name : l.plan,
     lifetime: l.expires_at === null,
@@ -325,7 +349,7 @@ route('GET', '/auth/dev', (req, res) => {
 
 /* ------------------------------------------------------------ public API */
 route('GET', '/api/config', (req, res) => {
-  sendJson(res, 200, { plans: Object.values(PLANS), upiReady: !!UPI_ID, discord: DISCORD_INVITE });
+  sendJson(res, 200, { plans: Object.values(PLANS), trial: TRIAL_HOURS ? { hours: TRIAL_HOURS } : null, upiReady: !!UPI_ID, discord: DISCORD_INVITE });
 });
 
 route('GET', '/api/me', (req, res) => {
@@ -376,6 +400,17 @@ route('POST', '/api/orders/:id/utr', csrf, needUser, limiter(15, 600000), async 
 });
 
 /* -------------------------------------------------------- license / HWID */
+route('POST', '/api/trial', csrf, needUser, limiter(10, 600000), (req, res) => {
+  if (!TRIAL_HOURS) return fail(res, 400, 'The free trial is not available right now.');
+  if (licOf(req.user.id)) return fail(res, 400, 'The free trial is only for accounts that never had a license.');
+  if (TRIAL_MIN_ACCOUNT_DAYS && discordAccountAgeDays(req.user.discord_id) < TRIAL_MIN_ACCOUNT_DAYS) {
+    return fail(res, 403, 'Your Discord account is too new for the free trial. You can still buy a plan.');
+  }
+  const l = grantTrial(req.user.id);
+  saveDb();
+  sendJson(res, 200, { ok: true, license: licView(l) });
+});
+
 route('GET', '/api/download', needUser, (req, res) => {
   const l = licOf(req.user.id);
   if (licState(l) !== 'active') return fail(res, 403, 'You need an active license to download the client.');
@@ -388,6 +423,7 @@ route('GET', '/api/download', needUser, (req, res) => {
 route('POST', '/api/hwid/reset', csrf, needUser, (req, res) => {
   const l = licOf(req.user.id);
   if (!l) return fail(res, 404, 'You have no license.');
+  if (l.plan === 'trial') return fail(res, 400, 'The free trial stays locked to the PC you first ran it on.');
   if (!l.hwid_hash) return fail(res, 400, 'Your key is not bound to any PC yet.');
   const next = (l.hwid_reset_at || 0) + HWID_RESET_COOLDOWN;
   if (l.hwid_reset_at && next > now()) return fail(res, 429, 'You can reset your PC binding once every 7 days.', { retry_at: next });
@@ -410,9 +446,15 @@ route('POST', '/api/verify', limiter(60, 60000), async (req, res) => {
   if (st === 'revoked') return bad('revoked');
   if (st === 'expired') return bad('expired');
   const h = sha256(hwid);
-  if (!l.hwid_hash) { l.hwid_hash = h; saveDb(); }
-  else if (l.hwid_hash !== h) return bad('hwid');
-  const plan = PLANS[l.plan];
+  if (!l.hwid_hash) {
+    if (l.plan === 'trial') {
+      if (DB.trial_hwids.includes(h)) return bad('trial_used'); // this PC already had a free trial
+      DB.trial_hwids.push(h);
+    }
+    l.hwid_hash = h;
+    saveDb();
+  } else if (l.hwid_hash !== h) return bad('hwid');
+  const plan = planInfo(l.plan);
   sendJson(res, 200, { ok: true, plan: plan ? plan.name : 'Plan', lifetime: l.expires_at === null, expires_at: l.expires_at || 0, server_time: now() });
 });
 
@@ -429,7 +471,7 @@ route('GET', '/api/admin/overview', needUser, needAdmin, (req, res) => {
   const recent = DB.orders.filter((o) => o.status === 'approved' || o.status === 'rejected').sort((a, b) => b.decided_at - a.decided_at).slice(0, 30).map(withUser);
   const licenses = DB.licenses.map((l) => {
     const u = userById(l.user_id) || {};
-    return { discord_id: u.discord_id, username: u.username, status: licState(l), planName: (PLANS[l.plan] || {}).name || l.plan, expires_at: l.expires_at, key: l.key, hwid_bound: !!l.hwid_hash };
+    return { discord_id: u.discord_id, username: u.username, status: licState(l), planName: (planInfo(l.plan) || {}).name || l.plan, expires_at: l.expires_at, key: l.key, hwid_bound: !!l.hwid_hash };
   }).sort((a, b) => String(a.username).localeCompare(String(b.username)));
   sendJson(res, 200, { pending, recent, licenses, upi: UPI_ID });
 });
@@ -519,10 +561,26 @@ const server = http.createServer((req, res) => {
   sendText(res, 404, 'Not found');
 });
 
-server.listen(PORT, () => {
-  console.log(`Enigma server running on ${BASE_URL} (port ${PORT})`);
-  if (!UPI_ID) console.log('Note: UPI_ID is empty, so customers cannot create orders yet.');
-  if (!DISCORD_CLIENT_ID) console.log('Note: Discord keys are empty, so login will not work yet.');
-  if (!ADMIN_IDS.length) console.log('Note: ADMIN_IDS is empty, so nobody can open /admin yet.');
-  if (DEV_MODE) console.log('DEV_MODE is ON: /auth/dev is open. Never use this on the live server.');
-});
+async function boot() {
+  if (REMOTE) {
+    try {
+      const saved = await REMOTE.load();
+      if (saved) { DB = saved; DB.trial_hwids = DB.trial_hwids || []; console.log('Loaded the database from Supabase.'); }
+      else { console.log('Supabase is empty, starting fresh' + (DB.users.length ? ' (copying the local data file into it).' : '.')); saveDb(); }
+    } catch (e) {
+      console.error('\nCannot reach Supabase, so the server will not start (this protects your data).\n' + e.message + '\nCheck SUPABASE_URL, SUPABASE_KEY and that the table "kv" exists.\n');
+      process.exit(1);
+    }
+    const bye = () => REMOTE.flush(8000).finally(() => process.exit(0));
+    process.on('SIGTERM', bye);
+    process.on('SIGINT', bye);
+  }
+  server.listen(PORT, () => {
+    console.log(`Enigma server running on ${BASE_URL} (port ${PORT})`);
+    if (!UPI_ID) console.log('Note: UPI_ID is empty, so customers cannot create orders yet.');
+    if (!DISCORD_CLIENT_ID) console.log('Note: Discord keys are empty, so login will not work yet.');
+    if (!ADMIN_IDS.length) console.log('Note: ADMIN_IDS is empty, so nobody can open /admin yet.');
+    if (DEV_MODE) console.log('DEV_MODE is ON: /auth/dev is open. Never use this on the live server.');
+  });
+}
+boot();
