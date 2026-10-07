@@ -1,0 +1,1 @@
+{"seq":{"user":1,"order":1},"users":[{"id":1,"discord_id":"1407951263051681832","username":"Biscuit","avatar":"7206645f08f0939fa4e92408efd2aaae","created_at":1791375628}],"licenses":[],"orders":[{"id":1,"user_id":1,"plan":"life","amount":1500,"utr":null,"status":"created","created_at":1791375636,"utr_at":0,"decided_at":0,"note":""}]}
