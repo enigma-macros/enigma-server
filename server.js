@@ -415,7 +415,8 @@ route('GET', '/api/download', needUser, (req, res) => {
   const l = licOf(req.user.id);
   if (licState(l) !== 'active') return fail(res, 403, 'You need an active license to download the client.');
   if (!fs.existsSync(CLIENT_FILE)) return fail(res, 404, 'The client file is not uploaded on the server yet.');
-  const text = fs.readFileSync(CLIENT_FILE, 'utf8').split('__LICENSE_BASE__').join(BASE_URL);
+  // Replace only the FIRST marker (the LicenseURL line). The client also contains the marker text inside its own safety check, which must stay untouched.
+  const text = fs.readFileSync(CLIENT_FILE, 'utf8').replace('__LICENSE_BASE__', () => BASE_URL);
   res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="Enigma.ahk"', 'Cache-Control': 'no-store' });
   res.end(text);
 });
