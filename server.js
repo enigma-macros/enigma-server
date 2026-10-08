@@ -10,6 +10,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 /* ------------------------------------------------------------------ .env */
 (function loadEnv() {
@@ -411,19 +412,60 @@ route('POST', '/api/trial', csrf, needUser, limiter(10, 600000), (req, res) => {
   sendJson(res, 200, { ok: true, license: licView(l) });
 });
 
+/* ---- minimal ZIP writer (no packages needed) ---- */
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(buf) { let c = 0xFFFFFFFF; for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(files) {
+  const d = new Date();
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  const parts = [], central = []; let offset = 0;
+  for (const f of files) {
+    const name = Buffer.from(f.name, 'utf8');
+    const packed = zlib.deflateRawSync(f.data);
+    const deflated = packed.length < f.data.length;
+    const body = deflated ? packed : f.data;
+    const crc = crc32(f.data);
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x0800, 6); lh.writeUInt16LE(deflated ? 8 : 0, 8);
+    lh.writeUInt16LE(dosTime, 10); lh.writeUInt16LE(dosDate, 12); lh.writeUInt32LE(crc, 14);
+    lh.writeUInt32LE(body.length, 18); lh.writeUInt32LE(f.data.length, 22); lh.writeUInt16LE(name.length, 26);
+    parts.push(lh, name, body);
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0x0800, 8); ch.writeUInt16LE(deflated ? 8 : 0, 10);
+    ch.writeUInt16LE(dosTime, 12); ch.writeUInt16LE(dosDate, 14); ch.writeUInt32LE(crc, 16);
+    ch.writeUInt32LE(body.length, 20); ch.writeUInt32LE(f.data.length, 24); ch.writeUInt16LE(name.length, 28); ch.writeUInt32LE(offset, 42);
+    central.push(ch, name);
+    offset += 30 + name.length + body.length;
+  }
+  const cd = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(files.length, 8); end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, cd, end]);
+}
+
 route('GET', '/api/download', needUser, (req, res) => {
   const l = licOf(req.user.id);
   if (licState(l) !== 'active') return fail(res, 403, 'You need an active license to download the client.');
-  // If a compiled private/Enigma.exe exists, buyers get it (no AutoHotkey needed). Add ?type=ahk to get the script instead.
-  const EXE_FILE = path.join(__dirname, 'private', 'Enigma.exe');
-  if (String(req.query.type || '') !== 'ahk' && fs.existsSync(EXE_FILE)) {
-    const exe = fs.readFileSync(EXE_FILE);
-    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="Enigma.exe"', 'Content-Length': exe.length, 'Cache-Control': 'no-store' });
-    return res.end(exe);
-  }
   if (!fs.existsSync(CLIENT_FILE)) return fail(res, 404, 'The client file is not uploaded on the server yet.');
   // Replace only the FIRST marker (the LicenseURL line). The client also contains the marker text inside its own safety check, which must stay untouched.
   const text = fs.readFileSync(CLIENT_FILE, 'utf8').replace('__LICENSE_BASE__', () => BASE_URL);
+  const EXE_FILE = path.join(__dirname, 'private', 'Enigma.exe');
+  // If private/Enigma.exe exists (AutoHotkey64.exe renamed), buyers get a ZIP with it plus their ready-made Enigma.ahk, so nothing has to be installed.
+  // Add ?type=ahk to get just the script.
+  if (String(req.query.type || '') !== 'ahk' && fs.existsSync(EXE_FILE)) {
+    const files = [
+      { name: 'Enigma.exe', data: fs.readFileSync(EXE_FILE) },
+      { name: 'Enigma.ahk', data: Buffer.from(text, 'utf8') },
+      { name: 'READ ME FIRST.txt', data: Buffer.from('HOW TO RUN ENIGMA\r\n\r\n1. Do NOT run it from inside the zip. Right-click the zip and choose "Extract All".\r\n2. Open the extracted folder and double-click Enigma.exe (keep Enigma.exe and Enigma.ahk together in the same folder).\r\n3. Paste your license key when asked.\r\n\r\nEnigma.exe is the free AutoHotkey v2 runtime (autohotkey.com), renamed so it opens Enigma.ahk automatically.\r\nIf Windows SmartScreen warns you, click "More info" then "Run anyway".\r\n', 'utf8') }
+    ];
+    const lic = path.join(__dirname, 'private', 'AutoHotkey-license.txt');
+    if (fs.existsSync(lic)) files.push({ name: 'AutoHotkey-license.txt', data: fs.readFileSync(lic) });
+    const zip = makeZip(files);
+    res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="Enigma.zip"', 'Content-Length': zip.length, 'Cache-Control': 'no-store' });
+    return res.end(zip);
+  }
   res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="Enigma.ahk"', 'Cache-Control': 'no-store' });
   res.end(text);
 });
