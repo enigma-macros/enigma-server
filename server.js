@@ -308,13 +308,16 @@ route('GET', '/auth/discord', (req, res) => {
   redirect(res, 'https://discord.com/oauth2/authorize?' + q);
 });
 
-/* ---- Discord API calls: send a proper User-Agent and wait out short rate limits (429) ---- */
+/* ---- Discord API calls: send a proper User-Agent and wait out short rate limits (429).
+   Free hosts share one outgoing IP, which Discord's Cloudflare sometimes blocks (error 1015).
+   Fix: set DISCORD_API to your own relay (see discord-proxy-worker.js) and DISCORD_PROXY_KEY to its secret. ---- */
 const DISCORD_API = (process.env.DISCORD_API || 'https://discord.com/api').replace(/\/+$/, '');
 const DISCORD_UA = 'DiscordBot (' + BASE_URL + ', 1.0)';
 async function discordFetch(url, init) {
   init = init || {};
   for (let attempt = 0; ; attempt++) {
-    const r = await fetch(url, Object.assign({}, init, { headers: Object.assign({ 'User-Agent': DISCORD_UA, Accept: 'application/json' }, init.headers || {}) }));
+    const extra = process.env.DISCORD_PROXY_KEY ? { 'X-Proxy-Key': process.env.DISCORD_PROXY_KEY.trim() } : {};
+    const r = await fetch(url, Object.assign({}, init, { headers: Object.assign({ 'User-Agent': DISCORD_UA, Accept: 'application/json' }, extra, init.headers || {}) }));
     if (r.status !== 429 || attempt >= 2) return r;
     let wait = Number(r.headers.get('retry-after')) || 0;
     try { const j = await r.clone().json(); if (j && j.retry_after) wait = Number(j.retry_after); } catch (e) { /* not json */ }
