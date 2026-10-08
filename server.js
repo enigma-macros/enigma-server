@@ -414,6 +414,13 @@ route('POST', '/api/trial', csrf, needUser, limiter(10, 600000), (req, res) => {
 route('GET', '/api/download', needUser, (req, res) => {
   const l = licOf(req.user.id);
   if (licState(l) !== 'active') return fail(res, 403, 'You need an active license to download the client.');
+  // If a compiled private/Enigma.exe exists, buyers get it (no AutoHotkey needed). Add ?type=ahk to get the script instead.
+  const EXE_FILE = path.join(__dirname, 'private', 'Enigma.exe');
+  if (String(req.query.type || '') !== 'ahk' && fs.existsSync(EXE_FILE)) {
+    const exe = fs.readFileSync(EXE_FILE);
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="Enigma.exe"', 'Content-Length': exe.length, 'Cache-Control': 'no-store' });
+    return res.end(exe);
+  }
   if (!fs.existsSync(CLIENT_FILE)) return fail(res, 404, 'The client file is not uploaded on the server yet.');
   // Replace only the FIRST marker (the LicenseURL line). The client also contains the marker text inside its own safety check, which must stay untouched.
   const text = fs.readFileSync(CLIENT_FILE, 'utf8').replace('__LICENSE_BASE__', () => BASE_URL);
