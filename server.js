@@ -308,20 +308,38 @@ route('GET', '/auth/discord', (req, res) => {
   redirect(res, 'https://discord.com/oauth2/authorize?' + q);
 });
 
+/* ---- Discord API calls: send a proper User-Agent and wait out short rate limits (429) ---- */
+const DISCORD_API = (process.env.DISCORD_API || 'https://discord.com/api').replace(/\/+$/, '');
+const DISCORD_UA = 'DiscordBot (' + BASE_URL + ', 1.0)';
+async function discordFetch(url, init) {
+  init = init || {};
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch(url, Object.assign({}, init, { headers: Object.assign({ 'User-Agent': DISCORD_UA, Accept: 'application/json' }, init.headers || {}) }));
+    if (r.status !== 429 || attempt >= 2) return r;
+    let wait = Number(r.headers.get('retry-after')) || 0;
+    try { const j = await r.clone().json(); if (j && j.retry_after) wait = Number(j.retry_after); } catch (e) { /* not json */ }
+    if (!wait || wait > 8) return r; // too long to wait inside one login request
+    await new Promise((ok) => setTimeout(ok, Math.ceil(wait * 1000) + 100));
+  }
+}
+async function discordFail(what, r) {
+  const body = (await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 160);
+  return new Error(what + ' ' + r.status + ' [' + (r.headers.get('content-type') || 'no type') + '] ' + body);
+}
 route('GET', '/auth/callback', async (req, res) => {
   const { code, state, error } = req.query;
   const saved = parseCookies(req.headers.cookie).bst;
   if (error || !code || !state || !saved || saved !== state) return redirect(res, '/?login=failed');
   try {
-    const tr = await fetch('https://discord.com/api/oauth2/token', {
+    const tr = await discordFetch(DISCORD_API + '/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ client_id: DISCORD_CLIENT_ID, client_secret: DISCORD_CLIENT_SECRET, grant_type: 'authorization_code', code: String(code), redirect_uri: BASE_URL + '/auth/callback' }),
     });
-    if (!tr.ok) throw new Error('token ' + tr.status);
+    if (!tr.ok) throw await discordFail('token', tr);
     const tok = await tr.json();
-    const ur = await fetch('https://discord.com/api/users/@me', { headers: { Authorization: 'Bearer ' + tok.access_token } });
-    if (!ur.ok) throw new Error('user ' + ur.status);
+    const ur = await discordFetch(DISCORD_API + '/users/@me', { headers: { Authorization: 'Bearer ' + tok.access_token } });
+    if (!ur.ok) throw await discordFail('user', ur);
     const du = await ur.json();
     if (!du || !/^\d{5,25}$/.test(String(du.id))) throw new Error('bad user');
     const u = upsertUser(String(du.id), String(du.global_name || du.username || 'user').slice(0, 64), du.avatar || null);
