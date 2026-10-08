@@ -10,7 +10,7 @@ SetMouseDelay 5
 ; ---------- make the Windows web control render in IE11 mode (needed for animations) ----------
 EmuKey := "HKCU\Software\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_BROWSER_EMULATION"
 GpuKey := "HKCU\Software\Microsoft\Internet Explorer\Main\FeatureControl\FEATURE_GPU_RENDERING"
-Exe := StrSplit(A_AhkPath, "\")[-1]
+Exe := A_IsCompiled ? A_ScriptName : StrSplit(A_AhkPath, "\")[-1]
 Cur := 0
 try {
     Cur := RegRead(EmuKey, Exe)
@@ -24,7 +24,10 @@ if Cur != 11001 {
     } catch {
     }
     if A_Args.Length = 0 {
-        Run('"' A_AhkPath '" "' A_ScriptFullPath '" emu')
+        if A_IsCompiled
+            Run('"' A_ScriptFullPath '" emu')
+        else
+            Run('"' A_AhkPath '" "' A_ScriptFullPath '" emu')
         ExitApp
     }
 }
@@ -474,6 +477,8 @@ LicText(r) {
         return "This license was revoked. Contact support on Discord."
     if r = "hwid"
         return "This key is bound to another PC. Reset the PC binding in your dashboard on the website."
+    if r = "trial_used"
+        return "This PC already used the free trial. Buy a plan on the website to keep using Enigma."
     if r = "net"
         return "Could not reach the license server. Check your internet connection."
     return "That key is not valid. Copy it again from your dashboard."
